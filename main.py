@@ -10,10 +10,17 @@ Fetch strategy, cheapest first:
      or loads pages but finds no email (the email may be rendered by JS).
   A dead domain (DNS/connection failure) is never escalated to Playwright:
   a browser cannot reach a server that doesn't answer at all.
+
+Built for a 512MB instance (Render free tier): one Chromium is launched
+lazily and shared by every request, all Playwright work is serialized behind
+an asyncio.Lock so at most one browser operation runs at a time, and a 30s
+watchdog aborts a stuck operation instead of letting it freeze the service.
 """
 
+from contextlib import asynccontextmanager
 from typing import Optional
 
+import asyncio
 import html
 import re
 from urllib.parse import urljoin, urlparse
@@ -21,10 +28,16 @@ from urllib.robotparser import RobotFileParser
 
 import httpx
 from fastapi import FastAPI
-from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
-app = FastAPI(title="signal-to-send email finder")
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    yield  # startup needs nothing — the browser launches lazily on first use
+    await close_browser()
+
+
+app = FastAPI(title="signal-to-send email finder", lifespan=lifespan)
 
 # A realistic browser User-Agent, because many sites (and CDNs like
 # Cloudflare) serve empty pages or 403s to obvious bot user agents.
@@ -44,6 +57,19 @@ PW_TIMEOUT_MS = 20_000
 # (network idle). Some sites poll forever and never go idle — that's fine,
 # we just take whatever is rendered by then.
 PW_IDLE_MS = 5_000
+
+# Hard cap on one full Playwright search (homepage + subpages). When it
+# trips, the browser context is closed and the request is answered anyway —
+# a stuck page must never freeze the whole service.
+PW_WATCHDOG_S = 30.0
+
+# Flags for running Chromium inside a small container:
+#   --disable-dev-shm-usage  Render's /dev/shm is tiny; write to /tmp
+#                            instead of crashing when shared memory fills.
+#   --no-sandbox             Chromium's sandbox needs privileges Render
+#                            doesn't grant; the container is the sandbox.
+#   --disable-gpu            no GPU on the instance; skip the probing.
+CHROMIUM_ARGS = ["--disable-dev-shm-usage", "--no-sandbox", "--disable-gpu"]
 
 # One regex covers both cases: a mailto: link like href="mailto:info@x.com"
 # *contains* a plain email, so matching the email pattern alone finds both
@@ -180,77 +206,145 @@ async def load_robots(client: httpx.AsyncClient, homepage: str) -> Optional[Robo
         return None
 
 
-def playwright_search(
+# --- Shared browser -------------------------------------------------------
+# Launching Chromium costs ~100MB and a few seconds. A 512MB instance can
+# afford that once, not once per request — so a single browser is launched
+# lazily and shared, and PW_LOCK serializes all Playwright work so at most
+# one browser operation is in flight; concurrent requests wait their turn.
+# (Async Playwright needs an event loop with subprocess support; uvicorn's
+# default loop qualifies on both Linux and Windows.)
+PW_LOCK = asyncio.Lock()
+_playwright = None
+_browser = None
+
+
+async def get_browser():
+    """The shared Chromium: launched on first use, relaunched automatically
+    if it has crashed or disconnected since. Callers must hold PW_LOCK."""
+    global _playwright, _browser
+    if _browser is not None and _browser.is_connected():
+        return _browser
+    from playwright.async_api import async_playwright
+
+    if _browser is not None:  # crashed/disconnected — drop the dead handle
+        try:
+            await _browser.close()
+        except Exception:
+            pass
+        _browser = None
+    if _playwright is None:
+        _playwright = await async_playwright().start()
+    _browser = await _playwright.chromium.launch(headless=True, args=CHROMIUM_ARGS)
+    return _browser
+
+
+async def close_browser() -> None:
+    """Shutdown hook: don't let Chromium outlive the service process."""
+    global _playwright, _browser
+    async with PW_LOCK:
+        if _browser is not None:
+            try:
+                await _browser.close()
+            except Exception:
+                pass
+            _browser = None
+        if _playwright is not None:
+            try:
+                await _playwright.stop()
+            except Exception:
+                pass
+            _playwright = None
+
+
+async def playwright_search(
     homepage: str, domain: str, robots: Optional[RobotFileParser]
 ) -> dict:
     """Second-chance search with a real headless browser, for sites that
     block plain HTTP clients or only render their email with JavaScript.
 
-    This uses Playwright's *sync* API and runs in a worker thread, because
-    driving Playwright's async API inside uvicorn's event loop is fragile
-    (especially on Windows, where browser subprocess handling differs).
+    Uses the shared browser with a fresh, throwaway context per request, so
+    requests never share cookies and page memory is released after each use.
+    Callers must hold PW_LOCK.
 
     Returns: {"email", "source_page", "loaded", "error"} — `loaded` tells the
     caller whether we ever got real page content (that's what separates
     "no email exists" from "the site blocked us")."""
     out = {"email": None, "source_page": None, "loaded": False, "error": None}
     try:
-        from playwright.sync_api import sync_playwright
+        browser = await get_browser()
     except ImportError:
         # Service still works without Playwright — httpx results just
         # can't be double-checked by a browser.
         out["error"] = "playwright not installed"
         return out
+    except Exception as exc:  # missing chromium, launch failure…
+        out["error"] = f"playwright failed to launch: {exc}"
+        return out
 
+    context = await browser.new_context(user_agent=USER_AGENT)
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            try:
-                page = browser.new_context(user_agent=USER_AGENT).new_page()
-
-                def render(url: str) -> Optional[str]:
-                    """Load a URL and return its rendered HTML, or None if
-                    the server answered with an error page (4xx/5xx)."""
-                    resp = page.goto(url, timeout=PW_TIMEOUT_MS, wait_until="load")
-                    try:
-                        page.wait_for_load_state("networkidle", timeout=PW_IDLE_MS)
-                    except Exception:
-                        pass  # never going idle just means take what we have
-                    if resp is not None and resp.status >= 400:
-                        return None
-                    return page.content()
-
-                page_html = render(homepage)
-                if page_html is None:
-                    return out  # loaded stays False → caller reports "blocked"
-                out["loaded"] = True
-
-                emails = extract_emails(page_html)
-                if emails:
-                    out["email"] = pick_best(emails, domain)
-                    out["source_page"] = page.url
-                    return out
-
-                for link in find_candidate_links(page_html, page.url, domain):
-                    # robots.txt applies no matter which client fetches.
-                    if robots and not robots.can_fetch(USER_AGENT, link):
-                        continue
-                    try:
-                        sub_html = render(link)
-                    except Exception:
-                        continue  # one broken subpage shouldn't end the search
-                    if sub_html is None:
-                        continue
-                    emails = extract_emails(sub_html)
-                    if emails:
-                        out["email"] = pick_best(emails, domain)
-                        out["source_page"] = page.url
-                        return out
-            finally:
-                browser.close()
-    except Exception as exc:  # timeouts, crashed browser, missing chromium…
+        # The watchdog. _search_in_context mutates `out` in place, so any
+        # progress made before a timeout (e.g. loaded=True) still counts.
+        await asyncio.wait_for(
+            _search_in_context(context, homepage, domain, robots, out),
+            timeout=PW_WATCHDOG_S,
+        )
+    except asyncio.TimeoutError:
+        out["error"] = f"playwright watchdog: exceeded {PW_WATCHDOG_S:.0f}s"
+    except Exception as exc:  # navigation timeout, crashed page…
         out["error"] = f"playwright failed: {exc}"
+    finally:
+        try:
+            await context.close()
+        except Exception:
+            pass  # context may already be dead with the browser; that's fine
     return out
+
+
+async def _search_in_context(
+    context, homepage: str, domain: str, robots: Optional[RobotFileParser], out: dict
+) -> None:
+    """The actual browsing, split out so the watchdog can cancel it."""
+    page = await context.new_page()
+
+    async def render(url: str) -> Optional[str]:
+        """Load a URL and return its rendered HTML, or None if the server
+        answered with an error page (4xx/5xx)."""
+        resp = await page.goto(url, timeout=PW_TIMEOUT_MS, wait_until="load")
+        try:
+            await page.wait_for_load_state("networkidle", timeout=PW_IDLE_MS)
+        except Exception:
+            pass  # never going idle just means take what we have
+        if resp is not None and resp.status >= 400:
+            return None
+        return await page.content()
+
+    page_html = await render(homepage)
+    if page_html is None:
+        return  # loaded stays False → caller reports "blocked"
+    out["loaded"] = True
+
+    emails = extract_emails(page_html)
+    if emails:
+        out["email"] = pick_best(emails, domain)
+        out["source_page"] = page.url
+        return
+
+    for link in find_candidate_links(page_html, page.url, domain):
+        # robots.txt applies no matter which client fetches.
+        if robots and not robots.can_fetch(USER_AGENT, link):
+            continue
+        try:
+            sub_html = await render(link)
+        except Exception:
+            continue  # one broken subpage shouldn't end the search
+        if sub_html is None:
+            continue
+        emails = extract_emails(sub_html)
+        if emails:
+            out["email"] = pick_best(emails, domain)
+            out["source_page"] = page.url
+            return
 
 
 @app.get("/")
@@ -341,8 +435,10 @@ async def find_email(req: FindEmailRequest) -> dict:
                         )
 
     # --- Phase 2: Playwright (httpx was refused, or found no email) ---
-    # Runs in a thread so the browser work doesn't block the event loop.
-    pw = await run_in_threadpool(playwright_search, homepage, domain, robots)
+    # Serialized: concurrent requests queue here for their turn at the one
+    # shared browser — the 512MB instance can't run Chromium work in parallel.
+    async with PW_LOCK:
+        pw = await playwright_search(homepage, domain, robots)
 
     if pw["email"]:
         return result(
